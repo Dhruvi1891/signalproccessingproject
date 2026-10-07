@@ -1,0 +1,138 @@
+clc; clear; close all;
+
+% dynamic dialogue booster 
+
+[audio, Fs] = audioread('jonathanslattermusic_football_commentator_with_fx_that_is_nothing_but_incredible_546898_V3.wav');
+
+if size(audio,2) > 1
+    audio_mono = mean(audio,2);
+else
+    audio_mono = audio;
+end
+
+N = length(audio_mono);
+t = (0:N-1)/Fs;
+%defining the speech band of the audio used by us
+low_cutoff = 200;
+high_cutoff = 5000;
+[b, a] = butter(4, [low_cutoff high_cutoff]/(Fs/2), 'bandpass');
+speech_band = filtfilt(b, a, audio_mono);
+
+raw_env = abs(speech_band);
+raw_env = movmean(raw_env, round(0.03*Fs));
+raw_env = raw_env / max(raw_env);
+attack_time  = 0.01;   % 10 ms - reacts quickly when dialogue starts
+release_time = 0.25;   % 250 ms - eases off slowly when dialogue stops
+attack_coeff  = exp(-1/(attack_time*Fs));
+release_coeff = exp(-1/(release_time*Fs));
+
+env = zeros(size(raw_env));
+env(1) = raw_env(1);
+for n = 2:length(raw_env)
+    if raw_env(n) > env(n-1)
+        env(n) = attack_coeff*env(n-1) + (1-attack_coeff)*raw_env(n);
+    else
+        env(n) = release_coeff*env(n-1) + (1-release_coeff)*raw_env(n);
+    end
+end
+
+% noise reduction (soft subtraction)
+win_len = 1024;
+hop = win_len/4;
+[S, F, T] = spectrogram(audio_mono, hamming(win_len), win_len-hop, win_len, Fs, 'twosided');
+mag = abs(S);
+phase = angle(S);
+
+frame_energy = sum(mag.^2, 1);
+[~, idx] = sort(frame_energy);
+noise_frames = idx(1:max(1, round(0.1*length(idx))));
+noise_profile = mean(mag(:, noise_frames), 2);
+
+% softer subtraction + higher floor = no musical noise / artifacts
+mag_clean = max(mag - 1.0*noise_profile, 0.15*mag);
+S_clean = mag_clean .* exp(1i*phase);
+denoised = istft_manual(S_clean, hop, win_len, N);
+
+% mildly boosting for clarity 
+[bp, ap] = butter(4, [2000 4000]/(Fs/2), 'bandpass');
+presence = filtfilt(bp, ap, denoised);
+denoised = denoised + 0.3*presence;
+
+%  compression
+threshold = 0.2;
+ratio = 3;
+comp_env = movmean(abs(denoised), round(0.015*Fs));
+gain_reduction = ones(size(comp_env));
+above = comp_env > threshold;
+gain_reduction(above) = (threshold + (comp_env(above)-threshold)/ratio) ./ comp_env(above);
+compressed_voice = denoised .* gain_reduction;
+compressed_voice = compressed_voice / max(abs(compressed_voice)) * max(abs(denoised));
+
+% ---- background gain
+boost_amount = 1.6;
+duck_amount  = 0.45;  
+gain = duck_amount + (boost_amount - duck_amount) * env
+% no extra movmean needed here (that was flattening things too bluntly before)
+
+gain_full = repmat(gain, 1, size(audio,2));
+background_shaped = audio .* gain_full;
+
+output = background_shaped + 0.9 * repmat(compressed_voice, 1, size(audio,2));
+output = output / max(abs(output(:)));
+
+sound(output, Fs);
+audiowrite('enhanced_audio.wav', output, Fs);
+audiowrite('original_mix.wav', audio, Fs);
+
+figure;
+plot(t, audio_mono);
+xlabel('Time (s)'); ylabel('Amplitude');
+title('Original Mixed Audio');
+grid on;
+
+figure;
+plot(t, raw_env, 'b'); hold on;
+plot(t, env, 'r', 'LineWidth', 1.2);
+legend('Raw envelope', 'Attack/release smoothed');
+xlabel('Time (s)'); ylabel('Envelope');
+title('Dialogue Envelope Before vs After Smoothing');
+grid on;
+
+figure;
+plot(t, gain);
+xlabel('Time (s)'); ylabel('Gain');
+title('Background Gain Curve (smooth, no snapping)');
+grid on;
+
+figure;
+plot(t, compressed_voice);
+xlabel('Time (s)'); ylabel('Amplitude');
+title('Denoised + Compressed Dialogue');
+grid on;
+
+figure;
+plot(t, mean(output,2));
+xlabel('Time (s)'); ylabel('Amplitude');
+title('Final Enhanced Audio');
+grid on;
+
+% ------------------------------------------------------------------
+function x = istft_manual(S, hop, win_len, target_len)
+    win = hamming(win_len);
+    n_frames = size(S, 2);
+    x = zeros((n_frames-1)*hop + win_len, 1);
+    norm_buf = zeros(size(x));
+    for k = 1:n_frames
+        frame = real(ifft(S(:,k), win_len));
+        idx = (k-1)*hop + (1:win_len);
+        x(idx) = x(idx) + frame .* win;
+        norm_buf(idx) = norm_buf(idx) + win.^2;
+    end
+    norm_buf(norm_buf < 1e-8) = 1;
+    x = x ./ norm_buf;
+    if length(x) >= target_len
+        x = x(1:target_len);
+    else
+        x = [x; zeros(target_len-length(x),1)];
+    end
+end
